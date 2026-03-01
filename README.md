@@ -6,7 +6,9 @@ This tool is made for practical Kobo use:
 - check if fonts are Kobo-compatible,
 - generate legacy `kern` tables,
 - rename families (to avoid Kobo font collisions),
-- normalize style metadata (to improve Regular/Bold/Italic matching).
+- normalize style metadata (to improve Regular/Bold/Italic matching),
+- apply optical size scaling,
+- optionally set line gap directly.
 
 ## Why this exists
 
@@ -43,6 +45,9 @@ kobo-font-converter convert \
   /path/to/fonts/static/Vollkorn-BoldItalic.ttf \
   --output-dir /path/to/output/static \
   --family-name "Vollkorn Kobo" \
+  --output-name "VollkornKobo" \
+  --size-scale 1.05 \
+  --line-gap-percent 10 \
   --overwrite
 ```
 
@@ -70,7 +75,9 @@ kobo-font-converter convert "/path/to/fonts/*.ttf" --output-dir out
 - `--family-name "..."`: set internal font family name (recommended for Kobo to avoid old/new family collisions).
 - `--no-fix-metadata`: skip metadata normalization.
 - `--overwrite`: replace existing output files.
-- `--suffix -kobo`: add filename suffix.
+- `--output-name YZ_CrimsonPro`: directly set output filename base for all styles.
+- `--size-scale 1.05`: scale glyphs and key metrics uniformly (overall optical size).
+- `--line-gap-percent 10`: set line gap to a percentage of UPM.
 - `--force-rebuild-kern`: rebuild `kern` even if already present.
 - `--remove-gpos`: remove `GPOS` after conversion (Kobo-only preference).
 - `--max-pairs-per-subtable 10000`: chunk size for legacy `kern` subtables.

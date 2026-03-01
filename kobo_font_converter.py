@@ -8,6 +8,7 @@ Kobo kepub rendering engines.
 from __future__ import annotations
 
 import argparse
+import glob as pyglob
 import json
 import re
 import shutil
@@ -90,9 +91,22 @@ def parse_args() -> argparse.Namespace:
         help="Skip Kobo-oriented style/weight/PANOSE metadata normalization.",
     )
     convert.add_argument(
-        "--suffix",
-        default="",
-        help="Optional suffix added to filename stem (e.g. -kobo)",
+        "--output-name",
+        help=(
+            "Output filename base for style set (e.g. YZ_CrimsonPro -> "
+            "YZ_CrimsonPro-Regular.ttf, YZ_CrimsonPro-Bold.ttf)"
+        ),
+    )
+    convert.add_argument(
+        "--size-scale",
+        type=float,
+        default=1.0,
+        help="Overall font optical scale factor (default: 1.0)",
+    )
+    convert.add_argument(
+        "--line-gap-percent",
+        type=float,
+        help="Set line gap to percent of UPM (e.g. 20 for 20%%).",
     )
     convert.add_argument(
         "--overwrite",
@@ -134,7 +148,7 @@ def expand_inputs(inputs: List[str]) -> List[Path]:
     for raw in inputs:
         p = Path(raw)
         if any(ch in raw for ch in "*?[]"):
-            matches = sorted(Path().glob(raw))
+            matches = [Path(m) for m in sorted(pyglob.glob(raw, recursive=True))]
         elif p.is_dir():
             matches = sorted(p.rglob("*.ttf"))
         else:
@@ -299,6 +313,104 @@ def add_legacy_kern(font: TTFont, kern_pairs: Dict[Pair, int], max_pairs_per_sub
     return len(items), len(kern_table.kernTables)
 
 
+def _scale_int(value: int, factor: float) -> int:
+    return int(round(value * factor))
+
+
+def apply_optical_scale(font: TTFont, factor: float) -> None:
+    if abs(factor - 1.0) < 1e-9:
+        return
+
+    if "glyf" in font:
+        glyf = font["glyf"]
+        for glyph in glyf.glyphs.values():
+            glyph.expand(glyf)
+            if glyph.isComposite():
+                for comp in getattr(glyph, "components", []):
+                    comp.x = _scale_int(comp.x, factor)
+                    comp.y = _scale_int(comp.y, factor)
+            elif getattr(glyph, "numberOfContours", 0) > 0 and hasattr(glyph, "coordinates"):
+                glyph.coordinates.scale((factor, factor))
+                glyph.coordinates.toInt()
+
+    if "hmtx" in font:
+        hmtx = font["hmtx"].metrics
+        for gname, (adv, lsb) in list(hmtx.items()):
+            hmtx[gname] = (_scale_int(adv, factor), _scale_int(lsb, factor))
+
+    if "hhea" in font:
+        hhea = font["hhea"]
+        for field in (
+            "ascent",
+            "descent",
+            "lineGap",
+            "advanceWidthMax",
+            "minLeftSideBearing",
+            "minRightSideBearing",
+            "xMaxExtent",
+            "caretOffset",
+        ):
+            if hasattr(hhea, field):
+                setattr(hhea, field, _scale_int(getattr(hhea, field), factor))
+
+    if "head" in font:
+        head = font["head"]
+        for field in ("xMin", "yMin", "xMax", "yMax"):
+            if hasattr(head, field):
+                setattr(head, field, _scale_int(getattr(head, field), factor))
+
+    if "OS/2" in font:
+        os2 = font["OS/2"]
+        for field in (
+            "xAvgCharWidth",
+            "ySubscriptXSize",
+            "ySubscriptYSize",
+            "ySubscriptXOffset",
+            "ySubscriptYOffset",
+            "ySuperscriptXSize",
+            "ySuperscriptYSize",
+            "ySuperscriptXOffset",
+            "ySuperscriptYOffset",
+            "yStrikeoutSize",
+            "yStrikeoutPosition",
+            "sTypoAscender",
+            "sTypoDescender",
+            "sTypoLineGap",
+            "usWinAscent",
+            "usWinDescent",
+            "sxHeight",
+            "sCapHeight",
+        ):
+            if hasattr(os2, field):
+                setattr(os2, field, _scale_int(getattr(os2, field), factor))
+
+    if "post" in font:
+        post = font["post"]
+        for field in ("underlinePosition", "underlineThickness"):
+            if hasattr(post, field):
+                setattr(post, field, _scale_int(getattr(post, field), factor))
+
+    if "kern" in font:
+        for subtable in getattr(font["kern"], "kernTables", []):
+            table = getattr(subtable, "kernTable", None)
+            if table:
+                for pair, value in list(table.items()):
+                    table[pair] = _scale_int(value, factor)
+
+
+def apply_line_gap_percent(font: TTFont, percent: float) -> None:
+    upm = int(font["head"].unitsPerEm) if "head" in font else 1000
+    gap = int(round(upm * percent / 100.0))
+
+    if "hhea" in font:
+        font["hhea"].lineGap = gap
+
+    if "OS/2" in font:
+        os2 = font["OS/2"]
+        if hasattr(os2, "sTypoLineGap"):
+            os2.sTypoLineGap = gap
+
+
 def _first_name(font: TTFont, name_ids: List[int]) -> str:
     name_table = font["name"]
     preferred = sorted(
@@ -338,6 +450,10 @@ def infer_style_spec(path: Path) -> StyleSpec:
     if "italic" in name:
         return STYLE_SPECS["italic"]
     return STYLE_SPECS["regular"]
+
+
+def style_filename_token(style_spec: StyleSpec) -> str:
+    return style_spec.name.replace(" ", "")
 
 
 def remove_wws_name_records(font: TTFont) -> None:
@@ -401,15 +517,29 @@ def rename_family(font: TTFont, family_name: str) -> None:
         _set_or_add_name_records(name_table, 17, style_name)
 
 
-def output_path_for(source: Path, output_dir: Path, suffix: str) -> Path:
-    stem = source.stem + suffix if suffix else source.stem
+def output_path_for(
+    source: Path,
+    output_dir: Path,
+    output_name: str | None = None,
+    style_spec: StyleSpec | None = None,
+) -> Path:
+    if output_name and style_spec is not None:
+        stem = f"{output_name}-{style_filename_token(style_spec)}"
+    else:
+        stem = source.stem
     return output_dir / f"{stem}{source.suffix}"
 
 
 def convert_one(path: Path, args: argparse.Namespace) -> ConvertResult:
+    style_spec = infer_style_spec(path)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_path_for(path, output_dir, args.suffix)
+    out_path = output_path_for(
+        path,
+        output_dir,
+        args.output_name,
+        style_spec,
+    )
 
     if out_path.exists() and not args.overwrite:
         return ConvertResult(
@@ -423,7 +553,7 @@ def convert_one(path: Path, args: argparse.Namespace) -> ConvertResult:
     try:
         if not args.no_fix_metadata:
             remove_wws_name_records(font)
-            normalize_style_metadata(font, infer_style_spec(path))
+            normalize_style_metadata(font, style_spec)
 
         existing_subtables, existing_pairs = legacy_kern_stats(font)
 
@@ -431,7 +561,11 @@ def convert_one(path: Path, args: argparse.Namespace) -> ConvertResult:
             existing_pairs > 0
             and not args.force_rebuild_kern
             and not args.family_name
+            and args.no_fix_metadata
             and not args.remove_gpos
+            and not args.output_name
+            and abs(args.size_scale - 1.0) < 1e-9
+            and args.line_gap_percent is None
         )
         if should_copy_directly:
             shutil.copy2(path, out_path)
@@ -461,7 +595,14 @@ def convert_one(path: Path, args: argparse.Namespace) -> ConvertResult:
                         existing_kern_pairs=existing_pairs,
                     )
 
-                if not args.family_name and not args.remove_gpos:
+                if (
+                    not args.family_name
+                    and not args.remove_gpos
+                    and args.no_fix_metadata
+                    and not args.output_name
+                    and abs(args.size_scale - 1.0) < 1e-9
+                    and args.line_gap_percent is None
+                ):
                     shutil.copy2(path, out_path)
                     return ConvertResult(
                         source=str(path),
@@ -482,6 +623,11 @@ def convert_one(path: Path, args: argparse.Namespace) -> ConvertResult:
 
         if args.remove_gpos and "GPOS" in font:
             del font["GPOS"]
+
+        apply_optical_scale(font, args.size_scale)
+
+        if args.line_gap_percent is not None:
+            apply_line_gap_percent(font, args.line_gap_percent)
 
         font.save(str(out_path))
 
